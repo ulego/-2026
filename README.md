@@ -23,44 +23,40 @@ tesda - test sda
 
 ``` bash
 make
+```
 ## Результат: tesda.ko
 
 ## Очистка
-bash
+``` bash
 make clean
-Загрузка и выгрузка
-Загрузка модуля
-bash
+```
+## Загрузка и выгрузка
+### Загрузка модуля
+``` bash
 sudo insmod tesda.ko
-##После загрузки:
-
-Блочные устройства: /dev/sda0, /dev/sda1, /dev/sda2
-
-Символьные ссылки: /dev/tesda0, /dev/tesda1, /dev/tesda2
-
-Proc-файл: /proc/tesda
-
-Sysfs-класс: /sys/class/tesda/
+```
+## После загрузки:
+Блочные устройства: **/dev/sda0**, **/dev/sda1**, **/dev/sda2**
+Символьные ссылки: **/dev/tesda0**, **/dev/tesda1**, **/dev/tesda2**
+Proc-файл: **/proc/tesda**
+Sysfs-класс: **/sys/class/tesda/**
 
 ## Проверка:
-
-bash
+``` bash
 dmesg | tail
 cat /proc/tesda
 ls -la /dev/tesda*
-Выгрузка модуля
-bash
+```
+### Выгрузка модуля
 sudo rmmod tesda
-Удобные цели в Makefile
-bash
+## Удобные цели в Makefile
 make load   # загружает модуль
 make unload # выгружает модуль
 ## Использование
 Устройства tesda ведут себя как обычные блочные устройства. Данные записываются и читаются через стандартные системные вызовы read() и write().
 
 ##Пример на C:
-
-c
+``` C
 int fd = open("/dev/tesda0", O_RDWR);
 char buf[4096] = "Hello, tesda!";
 write(fd, buf, sizeof(buf));
