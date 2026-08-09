@@ -21,7 +21,7 @@ tesda - test sda
 
 ## Сборка
 
-```bash
+``` bash
 make
 ## Результат: tesda.ko
 
