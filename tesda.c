@@ -1,576 +1,560 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * tesda.c — Block device driver with 3 partitions (100 MiB each)
+ * tesda.c - учебный RAM-backed блочный драйвер для Linux 6.1.x.
  *
- * Kernel: 6.1.x
- * Device: /dev/sda{0,1,2} + symlinks /dev/tesda{0,1,2}
- * Backing: vmalloc(300 MiB)
- * Queue: blk_mq_init_queue (single-queue blk-mq)
+ * Драйвер создаёт три независимых блочных устройства:
+ *   /dev/tesda0
+ *   /dev/tesda1
+ *   /dev/tesda2
+ *
+ * Каждое устройство имеет размер 100 MiB. Общий backing store размером
+ * 300 MiB выделяется через vzalloc(). Для I/O используется blk-mq.
+ *
+ * Дополнительно реализованы:
+ *   - ioctl: RESET, GETINFO, GETSTAT, GETPARTITION;
+ *   - /proc/tesda со статистикой;
+ *   - /sys/block/tesdaN/tesda_id;
+ *   - /sys/block/tesdaN/tesda_start_sector;
+ *   - /sys/block/tesdaN/tesda_stats.
  */
 
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/init.h>
+#include <linux/blk-mq.h>
 #include <linux/blkdev.h>
-#include <linux/genhd.h>
-#include <linux/backing-dev.h>
-#include <linux/fs.h>
-#include <linux/cdev.h>
 #include <linux/device.h>
-#include <linux/ioctl.h>
+#include <linux/err.h>
+#include <linux/highmem.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
-#include <linux/spinlock.h>
-#include <linux/vmalloc.h>
+#include <linux/slab.h>
+#include <linux/sysfs.h>
 #include <linux/uaccess.h>
-#include <linux/sched.h>
-#include <linux/moduleparam.h>
+#include <linux/vmalloc.h>
 
-#define DRIVER_NAME "tesda"
-#define PARTITIONS 3
-#define PART_SIZE_SECTORS (100 * 1024 * 1024 / 512) /* 209715200 sectors = 100 MiB */
-#define PART_SIZE_BYTES (100 * 1024 * 1024)          /* 104857600 bytes */
-#define TOTAL_SIZE_BYTES (PART_SIZE_BYTES * PARTITIONS) /* 314572800 bytes = 300 MiB */
-#define TOTAL_SIZE_SECTORS (PART_SIZE_SECTORS * PARTITIONS)
-#define PROC_NAME "tesda"
+#include "tesda_uapi.h"
 
-/* ============================================================
- * IOCTL definitions
- * ============================================================ */
+#define TESDA_NAME "tesda"
+#define TESDA_PART_SECTORS (TESDA_PART_SIZE_BYTES / TESDA_SECTOR_SIZE)
 
-#define TESDA_IOCTL_MAGIC 0xA0
-
-#define TESDA_IOCTL_RESET        _IO(TESDA_IOCTL_MAGIC, 0x01)
-#define TESDA_IOCTL_GETINFO      _IOWR(TESDA_IOCTL_MAGIC, 0x02, struct tesda_info)
-#define TESDA_IOCTL_GETSTAT      _IOWR(TESDA_IOCTL_MAGIC, 0x03, struct tesda_stat)
-#define TESDA_IOCTL_GETPARTITION _IOWR(TESDA_IOCTL_MAGIC, 0x04, struct tesda_partition_info)
-
-/* ============================================================
- * Data structures
- * ============================================================ */
-
-struct tesda_info {
-	__u32 partitions;
-	__u64 part_size;
-	__u64 total_size;
-	__u32 sector_size;
-	__u32 reserved;
+struct tesda_stats {
+  u64 reads;
+  u64 writes;
+  u64 bytes_read;
+  u64 bytes_written;
 };
 
-struct tesda_stat {
-	__u64 reads;
-	__u64 writes;
-	__u64 bytes_read;
-	__u64 bytes_written;
+struct tesda_dev;
+
+/* Описание одного логического устройства /dev/tesdaN. */
+struct tesda_part {
+  struct tesda_dev *dev;
+  struct gendisk *disk;
+  struct request_queue *queue;
+  int id;
+  bool added;
+  bool sysfs_added;
+  struct tesda_stats st;
 };
 
-struct tesda_partition_info {
-	__u32 id;
-	__u32 reserved;
-	__u64 start_sector;
-	__u64 nr_sectors;
-	char name[16];
-};
-
-struct tesda_part_stats {
-	__u64 reads;
-	__u64 writes;
-	__u64 bytes_read;
-	__u64 bytes_written;
-};
-
-/* Per-instance device state */
+/* Общие данные всего драйвера. */
 struct tesda_dev {
-	int major;
-	struct gendisk *gd;
-	struct request_queue *queue;
-	struct blk_mq_tag_set tq_set;
-	unsigned char *storage;
-	struct class *cls;
-	struct device *devices[PARTITIONS];
-	struct proc_dir_entry *proc_entry;
-	struct tesda_part_stats stats[PARTITIONS];
-	spinlock_t lock;
-	int open_count;
+  int major;
+  struct blk_mq_tag_set tag_set;
+  unsigned char *storage;
+  struct mutex lock;
+  struct tesda_part part[TESDA_PARTITIONS];
+  struct proc_dir_entry *proc;
 };
 
-static struct tesda_dev *tesda_dev_ptr;
+static struct tesda_dev *tesda;
 
-/* ============================================================
- * Helpers
- * ============================================================ */
-
-static int get_partition_from_sector(sector_t sector, int *part_id, sector_t *local_sector)
-{
-	if (sector >= TOTAL_SIZE_SECTORS)
-		return -EINVAL;
-
-	*part_id = sector / PART_SIZE_SECTORS;
-	*local_sector = sector - (*part_id * PART_SIZE_SECTORS);
-
-	/* Validate within partition bounds */
-	if (*local_sector >= PART_SIZE_SECTORS)
-		return -EINVAL;
-
-	return 0;
-}
-
-static sector_t get_partition_size_sectors(void)
-{
-	return PART_SIZE_SECTORS;
-}
-
-/* ============================================================
- * blk-mq queue_rq callback
- * ============================================================ */
-
+/*
+ * Обработка одного запроса blk-mq.
+ *
+ * bi_sector для каждого из трёх gendisk начинается с нуля. Поэтому сначала
+ * вычисляется смещение конкретного tesdaN внутри общего backing store, а затем
+ * добавляется смещение сектора внутри этого устройства.
+ */
 static blk_status_t tesda_queue_rq(struct blk_mq_hw_ctx *hctx,
-				   const struct blk_mq_queue_data *qd)
-{
-	struct request *req = qd->rq;
-	struct bio *bio;
-	int ret;
-	unsigned long flags;
+                                   const struct blk_mq_queue_data *bd) {
+  struct request *rq = bd->rq;
+  struct request_queue *q = rq->q;
+  struct tesda_part *part = q->queuedata;
+  struct tesda_dev *dev;
+  struct bio *bio;
+  blk_status_t status = BLK_STS_OK;
 
-	blk_mq_start_request(req);
+  (void)hctx;
 
-	/* Protect storage access with spinlock */
-	spin_lock_irqsave(&tesda_dev_ptr->lock, flags);
+  if (unlikely(!part || !part->dev || !part->dev->storage)) {
+    blk_mq_start_request(rq);
+    blk_mq_end_request(rq, BLK_STS_IOERR);
+    return BLK_STS_IOERR;
+  }
 
-	/* Iterate over each bio in the request */
-	__rq_for_each_bio(bio, req) {
-		sector_t sector = bio->bi_iter.bi_sector;
-		int part_id;
-		sector_t local_sector;
-		unsigned int nr_sectors = bio_sectors(bio);
-		struct bio_vec bvec;
-		struct bvec_iter iter;
+  dev = part->dev;
+  blk_mq_start_request(rq);
 
-		/* Determine partition and local offset */
-		ret = get_partition_from_sector(sector, &part_id, &local_sector);
-		if (ret) {
-			/* Out of bounds */
-			spin_unlock_irqrestore(&tesda_dev_ptr->lock, flags);
-			blk_mq_end_request(req, BLK_STS_IOERR);
-			return BLK_STS_IOERR;
-		}
+  /* Для учебного RAM-диска поддерживаем READ/WRITE и пустой FLUSH. */
+  if (req_op(rq) == REQ_OP_FLUSH) {
+    blk_mq_end_request(rq, BLK_STS_OK);
+    return BLK_STS_OK;
+  }
 
-		/* Validate range within partition */
-		if (local_sector + nr_sectors > PART_SIZE_SECTORS) {
-			spin_unlock_irqrestore(&tesda_dev_ptr->lock, flags);
-			blk_mq_end_request(req, BLK_STS_IOERR);
-			return BLK_STS_IOERR;
-		}
+  if (req_op(rq) != REQ_OP_READ && req_op(rq) != REQ_OP_WRITE) {
+    blk_mq_end_request(rq, BLK_STS_NOTSUPP);
+    return BLK_STS_NOTSUPP;
+  }
 
-		/* Calculate byte offset into backing store */
-		unsigned long long byte_offset = (unsigned long long)(local_sector * 512);
-		unsigned char *storage_ptr = tesda_dev_ptr->storage + byte_offset;
+  mutex_lock(&dev->lock);
 
-		if (bio_data_dir(bio) == READ) {
-			bio_for_each_segment(bvec, bio, iter) {
-				void *dst = kmap_local_page(bvec.bv_page);
-				memcpy(dst + bvec.bv_offset, storage_ptr, bvec.bv_len);
-				kunmap_local(dst);
-				storage_ptr += bvec.bv_len;
-			}
-			/* Update stats */
-			tesda_dev_ptr->stats[part_id].reads++;
-			tesda_dev_ptr->stats[part_id].bytes_read += bio->bi_iter.bi_size;
-		} else if (bio_data_dir(bio) == WRITE) {
-			bio_for_each_segment(bvec, bio, iter) {
-				void *src = kmap_local_page(bvec.bv_page);
-				memcpy(storage_ptr, src + bvec.bv_offset, bvec.bv_len);
-				kunmap_local(src);
-				storage_ptr += bvec.bv_len;
-			}
-			/* Update stats */
-			tesda_dev_ptr->stats[part_id].writes++;
-			tesda_dev_ptr->stats[part_id].bytes_written += bio->bi_iter.bi_size;
-		}
-	}
+  __rq_for_each_bio(bio, rq) {
+    sector_t sector = bio->bi_iter.bi_sector;
+    unsigned int nsectors = bio_sectors(bio);
+    u64 offset;
+    u64 remaining;
+    struct bio_vec bvec;
+    struct bvec_iter iter;
+    unsigned char *data_ptr;
 
-	spin_unlock_irqrestore(&tesda_dev_ptr->lock, flags);
-	blk_mq_end_request(req, BLK_STS_OK);
-	return BLK_STS_OK;
+    /* Запрос не должен выходить за границы одного tesdaN. */
+    if (sector >= TESDA_PART_SECTORS ||
+        nsectors > TESDA_PART_SECTORS - sector) {
+      status = BLK_STS_IOERR;
+      break;
+    }
+
+    offset =
+        (u64)part->id * TESDA_PART_SIZE_BYTES + (u64)sector * TESDA_SECTOR_SIZE;
+    remaining = bio->bi_iter.bi_size;
+
+    if (offset > TESDA_TOTAL_SIZE_BYTES ||
+        remaining > TESDA_TOTAL_SIZE_BYTES - offset) {
+      status = BLK_STS_IOERR;
+      break;
+    }
+
+    data_ptr = dev->storage + offset;
+
+    bio_for_each_segment(bvec, bio, iter) {
+      void *addr;
+
+      if (unlikely(bvec.bv_len > remaining)) {
+        status = BLK_STS_IOERR;
+        break;
+      }
+
+      addr = kmap_local_page(bvec.bv_page);
+
+      if (req_op(rq) == REQ_OP_READ)
+        memcpy((char *)addr + bvec.bv_offset, data_ptr, bvec.bv_len);
+      else
+        memcpy(data_ptr, (char *)addr + bvec.bv_offset, bvec.bv_len);
+
+      kunmap_local(addr);
+      data_ptr += bvec.bv_len;
+      remaining -= bvec.bv_len;
+    }
+
+    if (status != BLK_STS_OK)
+      break;
+
+    if (remaining != 0) {
+      status = BLK_STS_IOERR;
+      break;
+    }
+
+    if (req_op(rq) == REQ_OP_READ) {
+      part->st.reads++;
+      part->st.bytes_read += bio->bi_iter.bi_size;
+    } else {
+      part->st.writes++;
+      part->st.bytes_written += bio->bi_iter.bi_size;
+    }
+  }
+
+  mutex_unlock(&dev->lock);
+  blk_mq_end_request(rq, status);
+  return status;
 }
 
-/* ============================================================
- * block_device_operations
- * ============================================================ */
-
-static int tesda_open(struct block_device *bdev, fmode_t mode)
-{
-	struct tesda_dev *dev = bdev->bd_disk->private_data;
-
-	spin_lock(&dev->lock);
-	dev->open_count++;
-	spin_unlock(&dev->lock);
-	return 0;
-}
-
-static void tesda_release(struct gendisk *gd, fmode_t mode)
-{
-	struct tesda_dev *dev = gd->private_data;
-
-	spin_lock(&dev->lock);
-	if (dev->open_count > 0)
-		dev->open_count--;
-	spin_unlock(&dev->lock);
-}
-
-static int tesda_ioctl(struct block_device *bdev, fmode_t mode,
-		       unsigned int cmd, unsigned long arg)
-{
-	struct tesda_dev *dev = bdev->bd_disk->private_data;
-	struct tesda_partition_info part_info;
-	struct tesda_info info;
-	struct tesda_stat stat;
-	int i;
-	unsigned long flags;
-
-	/* Handle standard BLK* ioctl commands first */
-	if (_IOC_TYPE(cmd) != TESDA_IOCTL_MAGIC) {
-		return blk_ioctl(bdev, mode, cmd, arg);
-	}
-
-	switch (cmd) {
-	case TESDA_IOCTL_RESET: {
-		spin_lock_irqsave(&dev->lock, flags);
-
-		/* Free old storage, allocate new, zero it */
-		if (dev->storage)
-			vfree(dev->storage);
-
-		dev->storage = vmalloc(TOTAL_SIZE_BYTES);
-		if (!dev->storage) {
-			spin_unlock_irqrestore(&dev->lock, flags);
-			return -ENOMEM;
-		}
-		memset(dev->storage, 0, TOTAL_SIZE_BYTES);
-
-		/* Reset all stats */
-		for (i = 0; i < PARTITIONS; i++) {
-			dev->stats[i].reads = 0;
-			dev->stats[i].writes = 0;
-			dev->stats[i].bytes_read = 0;
-			dev->stats[i].bytes_written = 0;
-		}
-
-		spin_unlock_irqrestore(&dev->lock, flags);
-		break;
-	}
-
-	case TESDA_IOCTL_GETINFO: {
-		info.partitions = PARTITIONS;
-		info.part_size = PART_SIZE_BYTES;
-		info.total_size = TOTAL_SIZE_BYTES;
-		info.sector_size = 512;
-		info.reserved = 0;
-
-		if (copy_to_user((void __user *)arg, &info, sizeof(info)))
-			return -EFAULT;
-		break;
-	}
-
-	case TESDA_IOCTL_GETSTAT: {
-		spin_lock_irqsave(&dev->lock, flags);
-
-		/* Aggregate stats across all partitions */
-		memset(&stat, 0, sizeof(stat));
-		for (i = 0; i < PARTITIONS; i++) {
-			stat.reads += dev->stats[i].reads;
-			stat.writes += dev->stats[i].writes;
-			stat.bytes_read += dev->stats[i].bytes_read;
-			stat.bytes_written += dev->stats[i].bytes_written;
-		}
-
-		spin_unlock_irqrestore(&dev->lock, flags);
-
-		if (copy_to_user((void __user *)arg, &stat, sizeof(stat)))
-			return -EFAULT;
-		break;
-	}
-
-	case TESDA_IOCTL_GETPARTITION: {
-		/* User passes pointer to struct tesda_partition_info with id set */
-		if (copy_from_user(&part_info, (void __user *)arg, sizeof(part_info)))
-			return -EFAULT;
-
-		if (part_info.id >= PARTITIONS)
-			return -EINVAL;
-
-		part_info.start_sector = (__u64)part_info.id * PART_SIZE_SECTORS;
-		part_info.nr_sectors = PART_SIZE_SECTORS;
-		snprintf(part_info.name, sizeof(part_info.name), "tesda%d", part_info.id);
-
-		if (copy_to_user((void __user *)arg, &part_info, sizeof(part_info)))
-			return -EFAULT;
-		break;
-	}
-
-	default:
-		return -ENOTTY;
-	}
-
-	return 0;
-}
-
-static const struct block_device_operations tesda_blk_fops = {
-	.owner   = THIS_MODULE,
-	.open    = tesda_open,
-	.release = tesda_release,
-	.ioctl   = tesda_ioctl,
+/* Таблица операций blk-mq должна иметь статическое время жизни. */
+static const struct blk_mq_ops tesda_mq_ops = {
+    .queue_rq = tesda_queue_rq,
 };
 
-/* ============================================================
- * /proc interface
- * ============================================================ */
-
-static int tesda_proc_show(struct seq_file *m, void *v)
-{
-	struct tesda_dev *dev = m->private;
-	int i;
-
-	seq_printf(m, "Device: %s\n", DRIVER_NAME);
-	seq_printf(m, "Major: %d\n", dev->major);
-	seq_printf(m, "Partitions: %d\n\n", PARTITIONS);
-
-	for (i = 0; i < PARTITIONS; i++) {
-		seq_printf(m, "Partition %d:\n", i);
-		seq_printf(m, "  Name:     tesda%d\n", i);
-		seq_printf(m, "  Size:     %u MiB (%u sectors)\n",
-			   PART_SIZE_BYTES / (1024 * 1024), PART_SIZE_SECTORS);
-		seq_printf(m, "  Start:    %llu\n",
-			   (unsigned long long)i * PART_SIZE_SECTORS);
-		seq_printf(m, "  Reads:    %llu\n",
-			   (unsigned long long)dev->stats[i].reads);
-		seq_printf(m, "  Writes:   %llu\n",
-			   (unsigned long long)dev->stats[i].writes);
-		seq_printf(m, "  Bytes RD: %llu\n",
-			   (unsigned long long)dev->stats[i].bytes_read);
-		seq_printf(m, "  Bytes WR: %llu\n",
-			   (unsigned long long)dev->stats[i].bytes_written);
-		seq_puts(m, "\n");
-	}
-
-	return 0;
+static int tesda_open(struct block_device *bdev, fmode_t mode) {
+  (void)bdev;
+  (void)mode;
+  return 0;
 }
 
-static int tesda_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, tesda_proc_show, PDE_DATA(inode));
+static void tesda_release(struct gendisk *disk, fmode_t mode) {
+  (void)disk;
+  (void)mode;
+}
+
+/* ioctl-интерфейс пользовательского приложения. */
+static int tesda_ioctl(struct block_device *bdev, fmode_t mode,
+                       unsigned int cmd, unsigned long arg) {
+  struct tesda_part *part;
+  struct tesda_dev *dev;
+  struct tesda_info info;
+  struct tesda_stat stat = {0};
+  struct tesda_partition_info pi;
+  int i;
+
+  (void)mode;
+
+  if (unlikely(!bdev || !bdev->bd_disk))
+    return -ENODEV;
+
+  part = bdev->bd_disk->private_data;
+  if (unlikely(!part || !part->dev))
+    return -ENODEV;
+
+  dev = part->dev;
+
+  switch (cmd) {
+  case TESDA_IOCTL_RESET:
+    mutex_lock(&dev->lock);
+    memset(dev->storage, 0, TESDA_TOTAL_SIZE_BYTES);
+    for (i = 0; i < TESDA_PARTITIONS; i++)
+      memset(&dev->part[i].st, 0, sizeof(dev->part[i].st));
+    mutex_unlock(&dev->lock);
+    return 0;
+
+  case TESDA_IOCTL_GETINFO:
+    info.partitions = TESDA_PARTITIONS;
+    info.sector_size = TESDA_SECTOR_SIZE;
+    info.part_size_bytes = TESDA_PART_SIZE_BYTES;
+    info.total_size_bytes = TESDA_TOTAL_SIZE_BYTES;
+
+    return copy_to_user((void __user *)arg, &info, sizeof(info)) ? -EFAULT : 0;
+
+  case TESDA_IOCTL_GETSTAT:
+    mutex_lock(&dev->lock);
+    for (i = 0; i < TESDA_PARTITIONS; i++) {
+      stat.reads += dev->part[i].st.reads;
+      stat.writes += dev->part[i].st.writes;
+      stat.bytes_read += dev->part[i].st.bytes_read;
+      stat.bytes_written += dev->part[i].st.bytes_written;
+    }
+    mutex_unlock(&dev->lock);
+
+    return copy_to_user((void __user *)arg, &stat, sizeof(stat)) ? -EFAULT : 0;
+
+  case TESDA_IOCTL_GETPARTITION:
+    if (copy_from_user(&pi, (void __user *)arg, sizeof(pi)))
+      return -EFAULT;
+
+    if (pi.id >= TESDA_PARTITIONS)
+      return -EINVAL;
+
+    pi.reserved = 0;
+    pi.start_sector = (__u64)pi.id * TESDA_PART_SECTORS;
+    pi.nr_sectors = TESDA_PART_SECTORS;
+    snprintf(pi.name, sizeof(pi.name), "tesda%u", pi.id);
+
+    return copy_to_user((void __user *)arg, &pi, sizeof(pi)) ? -EFAULT : 0;
+
+  default:
+    return -ENOTTY;
+  }
+}
+
+static const struct block_device_operations tesda_fops = {
+    .owner = THIS_MODULE,
+    .open = tesda_open,
+    .release = tesda_release,
+    .ioctl = tesda_ioctl,
+};
+
+/* ------------------------- /proc/tesda ------------------------- */
+
+static int tesda_proc_show(struct seq_file *m, void *v) {
+  struct tesda_dev *dev = m->private;
+  int i;
+
+  (void)v;
+
+  if (!dev)
+    return -ENODEV;
+
+  mutex_lock(&dev->lock);
+
+  seq_printf(m, "Device: %s\nMajor: %d\nDevices: %u\n\n", TESDA_NAME,
+             dev->major, TESDA_PARTITIONS);
+
+  for (i = 0; i < TESDA_PARTITIONS; i++) {
+    const struct tesda_stats *st = &dev->part[i].st;
+
+    seq_printf(m, "Device %d:\n", i);
+    seq_printf(m, "  Name:       tesda%d\n", i);
+    seq_printf(m, "  Size:       100 MiB (%llu sectors)\n",
+               (unsigned long long)TESDA_PART_SECTORS);
+    seq_printf(m, "  Start:      %llu\n",
+               (unsigned long long)i * TESDA_PART_SECTORS);
+    seq_printf(m, "  Reads:      %llu\n", (unsigned long long)st->reads);
+    seq_printf(m, "  Writes:     %llu\n", (unsigned long long)st->writes);
+    seq_printf(m, "  Bytes read: %llu\n", (unsigned long long)st->bytes_read);
+    seq_printf(m, "  Bytes writ: %llu\n\n",
+               (unsigned long long)st->bytes_written);
+  }
+
+  mutex_unlock(&dev->lock);
+  return 0;
+}
+
+static int tesda_proc_open(struct inode *inode, struct file *file) {
+  return single_open(file, tesda_proc_show, pde_data(inode));
 }
 
 static const struct proc_ops tesda_proc_ops = {
-	.proc_open    = tesda_proc_open,
-	.proc_read    = seq_read,
-	.proc_lseek   = seq_lseek,
-	.proc_release = single_release,
+    .proc_open = tesda_proc_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
 };
 
-/* ============================================================
- * Module init / exit
- * ============================================================ */
+/* ------------------------- /sys/block/tesdaN ------------------------- */
 
-static int __init tesda_init(void)
-{
-	struct tesda_dev *dev;
-	int ret, i;
+static ssize_t tesda_id_show(struct device *device,
+                             struct device_attribute *attr, char *buf) {
+  struct gendisk *disk = dev_to_disk(device);
+  struct tesda_part *part = disk->private_data;
 
-	pr_info(DRIVER_NAME ": Loading module...\n");
+  (void)attr;
 
-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-	if (!dev) {
-		ret = -ENOMEM;
-		pr_err(DRIVER_NAME ": Failed to alloc device struct\n");
-		return ret;
-	}
+  if (!part)
+    return -ENODEV;
 
-	tesda_dev_ptr = dev;
-	spin_lock_init(&dev->lock);
-	dev->open_count = 0;
+  return sysfs_emit(buf, "%d\n", part->id);
+}
+static DEVICE_ATTR_RO(tesda_id);
 
-	/* 1. Register blkdev to get dynamic major */
-	dev->major = register_blkdev(0, DRIVER_NAME);
-	if (dev->major <= 0) {
-		ret = -ENODEV;
-		pr_err(DRIVER_NAME ": Failed to register blkdev\n");
-		goto err_kfree;
-	}
-	pr_info(DRIVER_NAME ": Registered with major %d\n", dev->major);
+static ssize_t tesda_start_sector_show(struct device *device,
+                                       struct device_attribute *attr,
+                                       char *buf) {
+  struct gendisk *disk = dev_to_disk(device);
+  struct tesda_part *part = disk->private_data;
 
-	/* 2. Setup blk-mq tag set */
-	dev->tq_set.ops = &(struct blk_mq_ops){
-		.queue_rq = tesda_queue_rq,
-	};
-	dev->tq_set.nr_hw_queues = 1;
-	dev->tq_set.queue_depth = 128;  /* reasonable depth */
-	dev->tq_set.numa_node = NUMA_NO_NODE;
-	dev->tq_set.flags = BLK_MQ_F_SINGLE_QUEUE;
+  (void)attr;
 
-	ret = blk_mq_alloc_tag_set(&dev->tq_set);
-	if (ret) {
-		pr_err(DRIVER_NAME ": Failed to alloc tag set: %d\n", ret);
-		goto err_unregister_blkdev;
-	}
+  if (!part)
+    return -ENODEV;
 
-	/* 3. Allocate disk structure */
-	dev->gd = alloc_disk(PARTITIONS);
-	if (!dev->gd) {
-		ret = -ENOMEM;
-		pr_err(DRIVER_NAME ": Failed to alloc disk\n");
-		goto err_free_tag_set;
-	}
+  return sysfs_emit(buf, "%llu\n",
+                    (unsigned long long)part->id * TESDA_PART_SECTORS);
+}
+static DEVICE_ATTR_RO(tesda_start_sector);
 
-	dev->gd->private_data = dev;
-	dev->gd->major = dev->major;
-	dev->gd->first_minor = 0;
-	dev->gd->fops = &tesda_blk_fops;
-	dev->gd->queue = NULL; /* set below */
-	sprintf(dev->gd->disk_name, "sda");
-	dev->gd->flags |= GENHD_FL_EXT_PAR;
+static ssize_t tesda_stats_show(struct device *device,
+                                struct device_attribute *attr, char *buf) {
+  struct gendisk *disk = dev_to_disk(device);
+  struct tesda_part *part = disk->private_data;
+  struct tesda_stats st;
 
-	/* 4. Initialize queue via blk-mq */
-	dev->queue = blk_mq_init_queue(&dev->tq_set);
-	if (IS_ERR(dev->queue)) {
-		ret = PTR_ERR(dev->queue);
-		pr_err(DRIVER_NAME ": Failed to init queue: %d\n", ret);
-		goto err_put_disk;
-	}
-	dev->gd->queue = dev->queue;
+  (void)attr;
 
-	/* 5. Set capacity */
-	set_capacity(dev->gd, TOTAL_SIZE_SECTORS);
+  if (!part || !part->dev)
+    return -ENODEV;
 
-	/* 6. Allocate backing store */
-	dev->storage = vmalloc(TOTAL_SIZE_BYTES);
-	if (!dev->storage) {
-		ret = -ENOMEM;
-		pr_err(DRIVER_NAME ": Failed to vmalloc backing store\n");
-		goto err_cleanup_queue;
-	}
-	memset(dev->storage, 0, TOTAL_SIZE_BYTES);
+  mutex_lock(&part->dev->lock);
+  st = part->st;
+  mutex_unlock(&part->dev->lock);
 
-	/* 7. Register disk */
-	add_disk(dev->gd);
-	pr_info(DRIVER_NAME ": Disk registered, capacity %u sectors\n",
-		(unsigned int)TOTAL_SIZE_SECTORS);
+  return sysfs_emit(
+      buf, "reads=%llu writes=%llu bytes_read=%llu bytes_written=%llu\n",
+      (unsigned long long)st.reads, (unsigned long long)st.writes,
+      (unsigned long long)st.bytes_read, (unsigned long long)st.bytes_written);
+}
+static DEVICE_ATTR_RO(tesda_stats);
 
-	/* 8. Create sysfs class and devices */
-	dev->cls = class_create(DRIVER_NAME);
-	if (IS_ERR(dev->cls)) {
-		ret = PTR_ERR(dev->cls);
-		pr_err(DRIVER_NAME ": Failed to create class: %d\n", ret);
-		goto err_vfree;
-	}
+static struct attribute *tesda_attrs[] = {
+    &dev_attr_tesda_id.attr,
+    &dev_attr_tesda_start_sector.attr,
+    &dev_attr_tesda_stats.attr,
+    NULL,
+};
 
-	for (i = 0; i < PARTITIONS; i++) {
-		dev->devices[i] = device_create(dev->cls, NULL,
-						MKDEV(dev->major, i),
-						NULL, "tesda%d", i);
-		if (IS_ERR(dev->devices[i])) {
-			ret = PTR_ERR(dev->devices[i]);
-			pr_err(DRIVER_NAME ": Failed to create device tesda%d: %d\n",
-			       i, ret);
-			goto err_destroy_devices;
-		}
-	}
+static const struct attribute_group tesda_attr_group = {
+    .attrs = tesda_attrs,
+};
 
-	/* 9. Create /proc entry */
-	dev->proc_entry = proc_create(PROC_NAME, 0444, NULL, &tesda_proc_ops);
-	if (dev->proc_entry) {
-		dev->proc_entry->private_data = dev;
-	} else {
-		pr_warn(DRIVER_NAME ": Failed to create /proc/%s\n", PROC_NAME);
-	}
+/*
+ * Освобить один gendisk.
+ *
+ * В Linux 6.1 blk_mq_alloc_disk() помечает диск GD_OWNS_QUEUE. После успешного
+ * add_disk() нужно вызвать del_gendisk(), затем put_disk(). Отдельный
+ * blk_cleanup_queue() здесь НЕ нужен и в целевых headers 6.1.130 недоступен.
+ */
+static void tesda_destroy_part(struct tesda_part *part) {
+  if (!part || !part->disk)
+    return;
 
-	pr_info(DRIVER_NAME ": Loaded successfully (major=%d)\n", dev->major);
-	return 0;
+  if (part->sysfs_added) {
+    sysfs_remove_group(&disk_to_dev(part->disk)->kobj, &tesda_attr_group);
+    part->sysfs_added = false;
+  }
 
-err_destroy_devices:
-	for (i = i - 1; i >= 0; i--)
-		device_destroy(dev->cls, MKDEV(dev->major, i));
-	class_destroy(dev->cls);
+  if (part->added) {
+    del_gendisk(part->disk);
+    part->added = false;
+  }
 
-err_vfree:
-	vfree(dev->storage);
-
-err_cleanup_queue:
-	blk_cleanup_queue(dev->queue);
-
-err_put_disk:
-	put_disk(dev->gd);
-
-err_free_tag_set:
-	blk_mq_free_tag_set(&dev->tq_set);
-
-err_unregister_blkdev:
-	unregister_blkdev(dev->major, DRIVER_NAME);
-
-err_kfree:
-	kfree(dev);
-	tesda_dev_ptr = NULL;
-
-	return ret;
+  put_disk(part->disk);
+  part->disk = NULL;
+  part->queue = NULL;
 }
 
-static void __exit tesda_exit(void)
-{
-	struct tesda_dev *dev = tesda_dev_ptr;
-	int i;
+static int __init tesda_init(void) {
+  struct tesda_dev *dev;
+  int i;
+  int ret;
 
-	if (!dev)
-		return;
+  dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+  if (!dev)
+    return -ENOMEM;
 
-	pr_info(DRIVER_NAME ": Unloading module...\n");
+  mutex_init(&dev->lock);
 
-	/* Reverse order of init */
+  /* vzalloc одновременно выделяет и обнуляет 300 MiB backing store. */
+  dev->storage = vzalloc(TESDA_TOTAL_SIZE_BYTES);
+  if (!dev->storage) {
+    ret = -ENOMEM;
+    goto err_dev;
+  }
 
-	/* 1. Remove proc entry */
-	if (dev->proc_entry)
-		remove_proc_entry(PROC_NAME, NULL);
+  dev->major = register_blkdev(0, TESDA_NAME);
+  if (dev->major < 0) {
+    ret = dev->major;
+    goto err_storage;
+  }
 
-	/* 2. Destroy devices */
-	for (i = 0; i < PARTITIONS; i++) {
-		if (dev->devices[i])
-			device_destroy(dev->cls, MKDEV(dev->major, i));
-	}
+  memset(&dev->tag_set, 0, sizeof(dev->tag_set));
+  dev->tag_set.ops = &tesda_mq_ops;
+  dev->tag_set.nr_hw_queues = 1;
+  dev->tag_set.queue_depth = 128;
+  dev->tag_set.numa_node = NUMA_NO_NODE;
+  dev->tag_set.cmd_size = 0;
+  dev->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+  dev->tag_set.driver_data = dev;
 
-	/* 3. Destroy class */
-	if (dev->cls)
-		class_destroy(dev->cls);
+  ret = blk_mq_alloc_tag_set(&dev->tag_set);
+  if (ret)
+    goto err_major;
 
-	/* 4. Cleanup queue first */
-	if (dev->queue)
-		blk_cleanup_queue(dev->queue);
+  for (i = 0; i < TESDA_PARTITIONS; i++) {
+    struct tesda_part *part = &dev->part[i];
 
-	/* 5. Remove disk */
-	if (dev->gd) {
-		del_gendisk(dev->gd);
-		put_disk(dev->gd);
-	}
+    part->dev = dev;
+    part->id = i;
 
-	/* 6. Free tag set */
-	blk_mq_free_tag_set(&dev->tq_set);
+    /*
+     * Linux 6.1: blk_mq_alloc_disk(tag_set, queuedata).
+     * Функция сама создаёт request_queue, поэтому alloc_disk() и
+     * blk_mq_init_queue() отдельно не вызываются.
+     */
+    part->disk = blk_mq_alloc_disk(&dev->tag_set, part);
+    if (IS_ERR(part->disk)) {
+      ret = PTR_ERR(part->disk);
+      part->disk = NULL;
+      goto err_parts;
+    }
 
-	/* 7. Free backing store */
-	if (dev->storage)
-		vfree(dev->storage);
+    part->queue = part->disk->queue;
+    if (unlikely(!part->queue)) {
+      ret = -ENODEV;
+      goto err_parts;
+    }
 
-	/* 8. Unregister char device */
-	unregister_blkdev(dev->major, DRIVER_NAME);
+    blk_queue_logical_block_size(part->queue, TESDA_SECTOR_SIZE);
+    blk_queue_physical_block_size(part->queue, TESDA_SECTOR_SIZE);
 
-	/* 9. Free device struct */
-	kfree(dev);
-	tesda_dev_ptr = NULL;
+    part->disk->major = dev->major;
+    part->disk->first_minor = i;
+    part->disk->minors = 1;
+    part->disk->fops = &tesda_fops;
+    part->disk->private_data = part;
 
-	pr_info(DRIVER_NAME ": Unloaded\n");
+    /* Каждый tesdaN сам является конечным блочным устройством. */
+    part->disk->flags |= GENHD_FL_NO_PART;
+
+    snprintf(part->disk->disk_name, DISK_NAME_LEN, "tesda%d", i);
+    set_capacity(part->disk, TESDA_PART_SECTORS);
+
+    ret = add_disk(part->disk);
+    if (ret)
+      goto err_parts;
+    part->added = true;
+
+    ret = sysfs_create_group(&disk_to_dev(part->disk)->kobj, &tesda_attr_group);
+    if (ret)
+      goto err_parts;
+    part->sysfs_added = true;
+  }
+
+  dev->proc = proc_create_data(TESDA_NAME, 0444, NULL, &tesda_proc_ops, dev);
+  if (!dev->proc) {
+    ret = -ENOMEM;
+    goto err_parts;
+  }
+
+  tesda = dev;
+  pr_info(TESDA_NAME ": loaded, major=%d, devices=/dev/tesda0..2\n",
+          dev->major);
+  return 0;
+
+err_parts:
+  /* Включая текущий элемент i: он мог быть создан, но не добавлен. */
+  while (i >= 0) {
+    tesda_destroy_part(&dev->part[i]);
+    i--;
+  }
+  blk_mq_free_tag_set(&dev->tag_set);
+err_major:
+  unregister_blkdev(dev->major, TESDA_NAME);
+err_storage:
+  vfree(dev->storage);
+err_dev:
+  kfree(dev);
+  return ret;
+}
+
+static void __exit tesda_exit(void) {
+  int i;
+  struct tesda_dev *dev = tesda;
+
+  if (!dev)
+    return;
+
+  /* Сначала запрещаем новые обращения через /proc. */
+  if (dev->proc) {
+    proc_remove(dev->proc);
+    dev->proc = NULL;
+  }
+
+  /* Удаляем диски и их очереди до освобождения общего tag_set. */
+  for (i = 0; i < TESDA_PARTITIONS; i++)
+    tesda_destroy_part(&dev->part[i]);
+
+  blk_mq_free_tag_set(&dev->tag_set);
+  unregister_blkdev(dev->major, TESDA_NAME);
+  vfree(dev->storage);
+  kfree(dev);
+  tesda = NULL;
+
+  pr_info(TESDA_NAME ": unloaded\n");
 }
 
 module_init(tesda_init);
 module_exit(tesda_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Project");
-MODULE_DESCRIPTION("Block device driver with 3 partitions of 100 MiB each");
-MODULE_VERSION("1.1");
+MODULE_AUTHOR("Oleg Ulanov");
+MODULE_DESCRIPTION("RAM-backed tesda block devices for Linux 6.1.x");
+MODULE_VERSION("1.0");

@@ -1,137 +1,152 @@
-# tesda — Блочное устройство ядра Linux
+# TESDA — RAM-backed block driver for Linux 6.1.x
 
-Драйвер блочного устройства `tesda` с тремя разделами по 100 MiB каждый.
-tesda - test sda
+Учебный блочный драйвер для Linux 6.1.x. Проект рассчитан на сборку с headers Linux 6.1.130 и использует современный для этой ветки интерфейс `blk-mq`.
 
-## Обзор
+## Что создаётся
 
-- **Тип:** блочное устройство (block device)
-- **Разделы:** 3 × 100 MiB (`/dev/tesda0`, `/dev/tesda1`, `/dev/tesda2`)
-- **Backing store:** 300 MiB в памяти ядра (`vmalloc`)
-- **Операции:** read, write, ioctl
-- **Интерфейсы:** `/dev`, `/proc`, `/sys`
-- **Очередь:** blk-mq single-queue
-- **Ядро:** Linux 6.1.x (и совместимые)
+После загрузки модуля должны появиться:
 
-## Требования
+- `/dev/tesda0` — 100 MiB;
+- `/dev/tesda1` — 100 MiB;
+- `/dev/tesda2` — 100 MiB;
+- `/proc/tesda` — информация и статистика;
+- `/sys/block/tesda0/tesda_id`, `tesda_start_sector`, `tesda_stats`;
+- аналогичные sysfs-файлы для `tesda1` и `tesda2`.
 
-- Ядро Linux 6.1.x с заголовочными файлами
-- `make`, `gcc`
-- Права root для загрузки модуля и доступа к устройствам
+Общий backing store — 300 MiB, выделяется через `vzalloc()`.
+
+## Почему здесь нет alloc_disk() и blk_cleanup_queue()
+
+В headers Linux 6.1.130 из исходного проекта `alloc_disk()` и `blk_cleanup_queue()` недоступны. Для blk-mq используется:
+
+```c
+blk_mq_alloc_disk(&dev->tag_set, part)
+```
+
+Она создаёт `gendisk` вместе с его `request_queue`.
+
+При удалении успешно зарегистрированного диска используется:
+
+```c
+del_gendisk(part->disk);
+put_disk(part->disk);
+```
+
+Отдельно освобождать очередь через `blk_cleanup_queue()` нельзя.
 
 ## Сборка
 
-``` bash
+Нужны gcc, make и headers текущего ядра.
+
+```bash
+uname -r
+make clean
 make
 ```
-## Результат: tesda.ko
 
-## Очистка
-``` bash
-make clean
-```
-## Загрузка и выгрузка
-### Загрузка модуля
-``` bash
-sudo insmod tesda.ko
-```
-## После загрузки:
-Блочные устройства: **/dev/sda0**, **/dev/sda1**, **/dev/sda2**
-Символьные ссылки: **/dev/tesda0**, **/dev/tesda1**, **/dev/tesda2**
-Proc-файл: **/proc/tesda**
-Sysfs-класс: **/sys/class/tesda/**
+Для указанной в задании системы ожидается примерно:
 
-## Проверка:
-``` bash
-dmesg | tail
+```text
+6.1.130
+```
+
+После сборки появятся `tesda.ko` и `test_tesda`.
+
+## Загрузка
+
+```bash
+sudo insmod ./tesda.ko
+```
+
+Проверка:
+
+```bash
+ls -l /dev/tesda*
 cat /proc/tesda
-ls -la /dev/tesda*
+make status
 ```
-### Выгрузка модуля
+
+Также полезно:
+
+```bash
+dmesg | tail -50
+lsblk
+```
+
+Если в минимальной системе нет udev/devtmpfs и файлы `/dev/tesdaN` не появились автоматически, major можно посмотреть в `/proc/devices` и создать nodes вручную. В обычном Debian/Ubuntu это обычно не требуется.
+
+## READ / WRITE
+
+Например:
+
+```bash
+echo "hello tesda" | sudo dd of=/dev/tesda0 bs=512 conv=sync
+sudo dd if=/dev/tesda0 bs=512 count=1 | hexdump -C
+```
+
+Каждое устройство имеет отдельный участок общего backing store, поэтому запись в `tesda0` не должна изменять данные `tesda1` или `tesda2`.
+
+## ioctl
+
+В `tesda_uapi.h` определены команды:
+
+- `TESDA_IOCTL_RESET` — обнулить все 300 MiB и статистику;
+- `TESDA_IOCTL_GETINFO` — получить размеры и число устройств;
+- `TESDA_IOCTL_GETSTAT` — получить суммарную статистику;
+- `TESDA_IOCTL_GETPARTITION` — получить описание выбранного tesdaN.
+
+Готовый пользовательский тест:
+
+```bash
+sudo ./test_tesda
+```
+
+Он выполняет RESET, GETINFO, GETPARTITION, GETSTAT, затем проверяет запись и чтение 4096 байт на всех трёх устройствах.
+
+## /proc
+
+```bash
+cat /proc/tesda
+```
+
+Показываются major, размеры, начальные секторы и счётчики операций.
+
+## /sys
+
+```bash
+cat /sys/block/tesda0/tesda_id
+cat /sys/block/tesda0/tesda_start_sector
+cat /sys/block/tesda0/tesda_stats
+```
+
+## Выгрузка
+
+Перед выгрузкой не должно быть смонтированных файловых систем на tesdaN.
+
+```bash
 sudo rmmod tesda
-## Удобные цели в Makefile
-make load   # загружает модуль
-make unload # выгружает модуль
-## Использование
-Устройства tesda ведут себя как обычные блочные устройства. Данные записываются и читаются через стандартные системные вызовы read() и write().
+```
 
-##Пример на C:
-``` C
-int fd = open("/dev/tesda0", O_RDWR);
-char buf[4096] = "Hello, tesda!";
-write(fd, buf, sizeof(buf));
+или:
 
-memset(buf, 0, sizeof(buf));
-lseek(fd, 0, SEEK_SET);
-read(fd, buf, sizeof(buf));
-// buf содержит "Hello, tesda!"
-close(fd);
-IOCTL команды
-TESDA_IOCTL_RESET
-Очищает все данные и сбрасывает статистику на всех разделах.
+```bash
+make unload
+```
 
-c
-ioctl(fd, TESDA_IOCTL_RESET);
-TESDA_IOCTL_GETINFO
-Возвращает информацию об устройстве.
+## Быстрая последовательность проверки
 
-c
-struct tesda_info info;
-ioctl(fd, TESDA_IOCTL_GETINFO, &info);
-// info.partitions     = 3
-// info.part_size      = 104857600  (100 MiB)
-// info.total_size     = 314572800  (300 MiB)
-// info.sector_size    = 512
-Структура:
+```bash
+make clean
+make
+sudo insmod ./tesda.ko
+ls -l /dev/tesda*
+cat /proc/tesda
+sudo ./test_tesda
+make status
+sudo rmmod tesda
+dmesg | tail -50
+```
 
-c
-struct tesda_info {
-    unsigned int partitions;
-    unsigned long long part_size;
-    unsigned long long total_size;
-    unsigned int sector_size;
-    unsigned int reserved;
-};
-TESDA_IOCTL_GETSTAT
-Возвращает агрегированную статистику по всем разделам.
+## Важное замечание по заданию
 
-c
-struct tesda_stat stat;
-ioctl(fd, TESDA_IOCTL_GETSTAT, &stat);
-// stat.reads, stat.writes, stat.bytes_read, stat.bytes_written
-TESDA_IOCTL_GETPARTITION
-Возвращает информацию о разделе. Передаётся структура с заполненным id.
-
-c
-struct tesda_partition_info info;
-info.id = 1;
-ioctl(fd, TESDA_IOCTL_GETPARTITION, &info);
-Интерфейс /proc/tesda
-Текстовый файл со статистикой по каждому разделу.
-
-Интерфейс /sys
-Устройство появляется в /sys/class/tesda/.
-
-##Тестирование
-Компиляция тестового приложения
-bash
-gcc -o test_tesda test_tesda.c
-Запуск
-bash
-sudo ./test_tesda /dev/tesda0 all
-sudo ./test_tesda /dev/tesda1 info
-Архитектура
-(см. схему в коде README)
-
-##Известные ограничения
-Память ядра: данные хранятся только в ОЗУ. При выгрузке модуля данные теряются.
-
-Без файловой системы: сырой блочный интерфейс.
-
-Права root: требуются для загрузки и управления.
-
-Single-queue: только одна очередь.
-
-##Лицензия
-GPL-2.0
-
+В старых учебных заданиях может требоваться `make_request_fn`. В Linux 6.1 этот старый путь уже не является нормальным API для нового драйвера; данный вариант использует `blk-mq` и callback `queue_rq`, что соответствует block layer Linux 6.1.x.
