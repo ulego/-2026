@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * tesda.c - учебный RAM-backed блочный драйвер для Linux 6.1.x.
+ * tesda.c - RAM-backed блочный драйвер для Linux 6.1.x.
  *
  * Драйвер создаёт три независимых блочных устройства:
  *   /dev/tesda0
@@ -18,57 +18,81 @@
  *   - /sys/block/tesdaN/tesda_stats.
  */
 
-#include <linux/blk-mq.h>
+/* Базовые типы block layer: gendisk, block_device_operations и др. */
 #include <linux/blkdev.h>
+/* Современный многoочередной интерфейс обработки запросов blk-mq. */
+#include <linux/blk-mq.h>
+/* struct device и преобразования между device и gendisk. */
 #include <linux/device.h>
+/* IS_ERR/PTR_ERR для функций, возвращающих ERR_PTR. */
 #include <linux/err.h>
+/* kmap_local_page/kunmap_local для доступа к страницам BIO. */
 #include <linux/highmem.h>
+/* __init/__exit и инфраструктура инициализации модулей. */
 #include <linux/init.h>
+/* Общие средства ядра: pr_info, snprintf, likely/unlikely и др. */
 #include <linux/kernel.h>
+/* module_init/module_exit и метаданные загружаемого модуля. */
 #include <linux/module.h>
+/* mutex защищает общий RAM backing store и статистику. */
 #include <linux/mutex.h>
+/* Создание диагностического файла /proc/tesda. */
 #include <linux/proc_fs.h>
+/* seq_file упрощает безопасный вывод длинного текста в /proc. */
 #include <linux/seq_file.h>
+/* kzalloc/kfree для управляющей структуры драйвера. */
 #include <linux/slab.h>
+/* Пользовательские read-only атрибуты в /sys/block/tesdaN. */
 #include <linux/sysfs.h>
+/* copy_to_user/copy_from_user для безопасной границы kernel/user. */
 #include <linux/uaccess.h>
+/* vzalloc/vfree для большого 300-MiB виртуально непрерывного буфера. */
 #include <linux/vmalloc.h>
 
 #include "tesda_uapi.h"
 
+/* Имя драйвера (придумано, как  TEST SDA -> tesda) для register_blkdev(), /proc
+ * и сообщений ядра. */
 #define TESDA_NAME "tesda"
+/* Размер одного 100-MiB устройства в логических секторах по 512 байт. */
 #define TESDA_PART_SECTORS (TESDA_PART_SIZE_BYTES / TESDA_SECTOR_SIZE)
 
+/* Внутренняя статистика одного tesdaN; наружу отдаётся через ioctl/sysfs/proc.
+ */
 struct tesda_stats {
-  u64 reads;
-  u64 writes;
-  u64 bytes_read;
-  u64 bytes_written;
+  u64 reads;         /* количество BIO с операцией READ */
+  u64 writes;        /* количество BIO с операцией WRITE */
+  u64 bytes_read;    /* объём успешно обработанных чтений */
+  u64 bytes_written; /* объём успешно обработанных записей */
 };
 
 struct tesda_dev;
 
 /* Описание одного логического устройства /dev/tesdaN. */
 struct tesda_part {
-  struct tesda_dev *dev;
-  struct gendisk *disk;
-  struct request_queue *queue;
-  int id;
-  bool added;
-  bool sysfs_added;
-  struct tesda_stats st;
+  struct tesda_dev *dev;       /* ссылка на общую структуру драйвера */
+  struct gendisk *disk;        /* объект block layer для /dev/tesdaN */
+  struct request_queue *queue; /* очередь запросов, принадлежащая gendisk */
+  int id;                      /* 0..2; определяет участок backing store */
+  bool added;                  /* был ли успешно выполнен add_disk() */
+  bool sysfs_added; /* создана ли группа пользовательских sysfs-атрибутов */
+  struct tesda_stats st; /* счётчики I/O именно этого устройства */
 };
 
 /* Общие данные всего драйвера. */
 struct tesda_dev {
-  int major;
-  struct blk_mq_tag_set tag_set;
-  unsigned char *storage;
-  struct mutex lock;
-  struct tesda_part part[TESDA_PARTITIONS];
-  struct proc_dir_entry *proc;
+  int major; /* динамически выделенный major number */
+  struct blk_mq_tag_set
+      tag_set;            /* общий набор тегов blk-mq для трёх очередей */
+  unsigned char *storage; /* 300 MiB RAM, разделённые на три диапазона */
+  struct mutex lock;      /* сериализует I/O, reset и чтение статистики */
+  struct tesda_part
+      part[TESDA_PARTITIONS];  /* описания tesda0, tesda1, tesda2 */
+  struct proc_dir_entry *proc; /* запись /proc/tesda */
 };
 
+/* Глобальный указатель нужен tesda_exit() для освобождения созданного
+ * экземпляра. */
 static struct tesda_dev *tesda;
 
 /*
@@ -80,6 +104,7 @@ static struct tesda_dev *tesda;
  */
 static blk_status_t tesda_queue_rq(struct blk_mq_hw_ctx *hctx,
                                    const struct blk_mq_queue_data *bd) {
+  /* bd->rq — запрос, который block layer передал драйверу на выполнение. */
   struct request *rq = bd->rq;
   struct request_queue *q = rq->q;
   struct tesda_part *part = q->queuedata;
@@ -87,6 +112,7 @@ static blk_status_t tesda_queue_rq(struct blk_mq_hw_ctx *hctx,
   struct bio *bio;
   blk_status_t status = BLK_STS_OK;
 
+  /* В этом RAM-драйвере конкретный hardware context не используется. */
   (void)hctx;
 
   if (unlikely(!part || !part->dev || !part->dev->storage)) {
@@ -98,7 +124,7 @@ static blk_status_t tesda_queue_rq(struct blk_mq_hw_ctx *hctx,
   dev = part->dev;
   blk_mq_start_request(rq);
 
-  /* Для учебного RAM-диска поддерживаем READ/WRITE и пустой FLUSH. */
+  /* Для RAM-диска поддерживаем READ/WRITE и пустой FLUSH. */
   if (req_op(rq) == REQ_OP_FLUSH) {
     blk_mq_end_request(rq, BLK_STS_OK);
     return BLK_STS_OK;
@@ -109,9 +135,11 @@ static blk_status_t tesda_queue_rq(struct blk_mq_hw_ctx *hctx,
     return BLK_STS_NOTSUPP;
   }
 
+  /* Один mutex делает доступ к общему буферу и счётчикам последовательным. */
   mutex_lock(&dev->lock);
 
   __rq_for_each_bio(bio, rq) {
+    /* Начальный сектор BIO относительно текущего /dev/tesdaN. */
     sector_t sector = bio->bi_iter.bi_sector;
     unsigned int nsectors = bio_sectors(bio);
     u64 offset;
@@ -127,6 +155,10 @@ static blk_status_t tesda_queue_rq(struct blk_mq_hw_ctx *hctx,
       break;
     }
 
+    /*
+     * Переводим локальный сектор tesdaN в абсолютный байтовый offset
+     * внутри общего 300-MiB storage: base(part) + sector * 512.
+     */
     offset =
         (u64)part->id * TESDA_PART_SIZE_BYTES + (u64)sector * TESDA_SECTOR_SIZE;
     remaining = bio->bi_iter.bi_size;
@@ -147,6 +179,10 @@ static blk_status_t tesda_queue_rq(struct blk_mq_hw_ctx *hctx,
         break;
       }
 
+      /*
+       * BIO хранит данные как страницы памяти. На время обработки
+       * сегмента отображаем страницу в адресное пространство ядра.
+       */
       addr = kmap_local_page(bvec.bv_page);
 
       if (req_op(rq) == REQ_OP_READ)
@@ -154,6 +190,7 @@ static blk_status_t tesda_queue_rq(struct blk_mq_hw_ctx *hctx,
       else
         memcpy(data_ptr, (char *)addr + bvec.bv_offset, bvec.bv_len);
 
+      /* Локальное отображение действительно только до kunmap_local(). */
       kunmap_local(addr);
       data_ptr += bvec.bv_len;
       remaining -= bvec.bv_len;
@@ -177,6 +214,7 @@ static blk_status_t tesda_queue_rq(struct blk_mq_hw_ctx *hctx,
   }
 
   mutex_unlock(&dev->lock);
+  /* Сообщаем block layer окончательный результат всего request. */
   blk_mq_end_request(rq, status);
   return status;
 }
@@ -186,12 +224,17 @@ static const struct blk_mq_ops tesda_mq_ops = {
     .queue_rq = tesda_queue_rq,
 };
 
+/*
+ * open callback block device. Специальной инициализации на каждое открытие
+ * не требуется, поэтому функция только подтверждает успешное открытие.
+ */
 static int tesda_open(struct block_device *bdev, fmode_t mode) {
   (void)bdev;
   (void)mode;
   return 0;
 }
 
+/* Парный callback close/release; отдельных ресурсов на open не выделяется. */
 static void tesda_release(struct gendisk *disk, fmode_t mode) {
   (void)disk;
   (void)mode;
@@ -218,8 +261,10 @@ static int tesda_ioctl(struct block_device *bdev, fmode_t mode,
 
   dev = part->dev;
 
+  /* cmd — уже закодированный номер ioctl из tesda_uapi.h. */
   switch (cmd) {
   case TESDA_IOCTL_RESET:
+    /* RESET атомарно очищает все пользовательские данные и счётчики. */
     mutex_lock(&dev->lock);
     memset(dev->storage, 0, TESDA_TOTAL_SIZE_BYTES);
     for (i = 0; i < TESDA_PARTITIONS; i++)
@@ -228,6 +273,7 @@ static int tesda_ioctl(struct block_device *bdev, fmode_t mode,
     return 0;
 
   case TESDA_IOCTL_GETINFO:
+    /* Заполняем структуру только kernel-константами текущего ABI. */
     info.partitions = TESDA_PARTITIONS;
     info.sector_size = TESDA_SECTOR_SIZE;
     info.part_size_bytes = TESDA_PART_SIZE_BYTES;
@@ -236,6 +282,7 @@ static int tesda_ioctl(struct block_device *bdev, fmode_t mode,
     return copy_to_user((void __user *)arg, &info, sizeof(info)) ? -EFAULT : 0;
 
   case TESDA_IOCTL_GETSTAT:
+    /* Суммируем статистику трёх независимых устройств под mutex. */
     mutex_lock(&dev->lock);
     for (i = 0; i < TESDA_PARTITIONS; i++) {
       stat.reads += dev->part[i].st.reads;
@@ -248,6 +295,8 @@ static int tesda_ioctl(struct block_device *bdev, fmode_t mode,
     return copy_to_user((void __user *)arg, &stat, sizeof(stat)) ? -EFAULT : 0;
 
   case TESDA_IOCTL_GETPARTITION:
+    /* Сначала получаем от процесса id, затем возвращаем заполненную структуру.
+     */
     if (copy_from_user(&pi, (void __user *)arg, sizeof(pi)))
       return -EFAULT;
 
@@ -262,10 +311,12 @@ static int tesda_ioctl(struct block_device *bdev, fmode_t mode,
     return copy_to_user((void __user *)arg, &pi, sizeof(pi)) ? -EFAULT : 0;
 
   default:
+    /* Стандартная ошибка для неизвестной ioctl-команды устройства. */
     return -ENOTTY;
   }
 }
 
+/* Таблица операций, которую block layer связывает с каждым gendisk TESDA. */
 static const struct block_device_operations tesda_fops = {
     .owner = THIS_MODULE,
     .open = tesda_open,
@@ -275,6 +326,7 @@ static const struct block_device_operations tesda_fops = {
 
 /* ------------------------- /proc/tesda ------------------------- */
 
+/* Формирует снимок состояния драйвера при чтении /proc/tesda. */
 static int tesda_proc_show(struct seq_file *m, void *v) {
   struct tesda_dev *dev = m->private;
   int i;
@@ -309,10 +361,12 @@ static int tesda_proc_show(struct seq_file *m, void *v) {
   return 0;
 }
 
+/* single_open связывает seq_file с одной функцией генерации вывода. */
 static int tesda_proc_open(struct inode *inode, struct file *file) {
   return single_open(file, tesda_proc_show, pde_data(inode));
 }
 
+/* Операции виртуального proc-файла; данные физически нигде не хранятся. */
 static const struct proc_ops tesda_proc_ops = {
     .proc_open = tesda_proc_open,
     .proc_read = seq_read,
@@ -322,6 +376,7 @@ static const struct proc_ops tesda_proc_ops = {
 
 /* ------------------------- /sys/block/tesdaN ------------------------- */
 
+/* Read-only sysfs: вернуть индекс текущего gendisk (0..2). */
 static ssize_t tesda_id_show(struct device *device,
                              struct device_attribute *attr, char *buf) {
   struct gendisk *disk = dev_to_disk(device);
@@ -336,6 +391,8 @@ static ssize_t tesda_id_show(struct device *device,
 }
 static DEVICE_ATTR_RO(tesda_id);
 
+/* Read-only sysfs: начало участка устройства в общем backing store, в секторах.
+ */
 static ssize_t tesda_start_sector_show(struct device *device,
                                        struct device_attribute *attr,
                                        char *buf) {
@@ -352,6 +409,7 @@ static ssize_t tesda_start_sector_show(struct device *device,
 }
 static DEVICE_ATTR_RO(tesda_start_sector);
 
+/* Read-only sysfs: вывести статистику только выбранного tesdaN. */
 static ssize_t tesda_stats_show(struct device *device,
                                 struct device_attribute *attr, char *buf) {
   struct gendisk *disk = dev_to_disk(device);
@@ -374,6 +432,7 @@ static ssize_t tesda_stats_show(struct device *device,
 }
 static DEVICE_ATTR_RO(tesda_stats);
 
+/* NULL-terminated список атрибутов, объединяемых в одну sysfs-группу. */
 static struct attribute *tesda_attrs[] = {
     &dev_attr_tesda_id.attr,
     &dev_attr_tesda_start_sector.attr,
@@ -411,11 +470,16 @@ static void tesda_destroy_part(struct tesda_part *part) {
   part->queue = NULL;
 }
 
+/*
+ * Точка загрузки модуля. Ресурсы создаются поэтапно; при любой ошибке goto
+ * переводит управление на нужную ступень обратного освобождения ресурсов.
+ */
 static int __init tesda_init(void) {
   struct tesda_dev *dev;
   int i;
   int ret;
 
+  /* kzalloc даёт нулевую начальную структуру, что упрощает error cleanup. */
   dev = kzalloc(sizeof(*dev), GFP_KERNEL);
   if (!dev)
     return -ENOMEM;
@@ -429,12 +493,14 @@ static int __init tesda_init(void) {
     goto err_dev;
   }
 
+  /* Ноль просит ядро автоматически выбрать свободный major number. */
   dev->major = register_blkdev(0, TESDA_NAME);
   if (dev->major < 0) {
     ret = dev->major;
     goto err_storage;
   }
 
+  /* Настраиваем общий tag set: одна software/hardware очередь глубиной 128. */
   memset(&dev->tag_set, 0, sizeof(dev->tag_set));
   dev->tag_set.ops = &tesda_mq_ops;
   dev->tag_set.nr_hw_queues = 1;
@@ -451,6 +517,7 @@ static int __init tesda_init(void) {
   for (i = 0; i < TESDA_PARTITIONS; i++) {
     struct tesda_part *part = &dev->part[i];
 
+    /* Инициализируем метаданные очередного логического диска. */
     part->dev = dev;
     part->id = i;
 
@@ -472,9 +539,11 @@ static int __init tesda_init(void) {
       goto err_parts;
     }
 
+    /* Сообщаем block layer геометрию: логический и физический блок 512 B. */
     blk_queue_logical_block_size(part->queue, TESDA_SECTOR_SIZE);
     blk_queue_physical_block_size(part->queue, TESDA_SECTOR_SIZE);
 
+    /* Заполняем обязательные поля gendisk перед публикацией add_disk(). */
     part->disk->major = dev->major;
     part->disk->first_minor = i;
     part->disk->minors = 1;
@@ -487,17 +556,21 @@ static int __init tesda_init(void) {
     snprintf(part->disk->disk_name, DISK_NAME_LEN, "tesda%d", i);
     set_capacity(part->disk, TESDA_PART_SECTORS);
 
+    /* После add_disk() устройство становится видимым block layer/udev. */
     ret = add_disk(part->disk);
     if (ret)
       goto err_parts;
     part->added = true;
 
+    /* Добавляем собственные read-only файлы к /sys/block/tesdaN. */
     ret = sysfs_create_group(&disk_to_dev(part->disk)->kobj, &tesda_attr_group);
     if (ret)
       goto err_parts;
     part->sysfs_added = true;
   }
 
+  /* Создаём единый диагностический /proc/tesda и передаём dev как private data.
+   */
   dev->proc = proc_create_data(TESDA_NAME, 0444, NULL, &tesda_proc_ops, dev);
   if (!dev->proc) {
     ret = -ENOMEM;
@@ -525,6 +598,10 @@ err_dev:
   return ret;
 }
 
+/*
+ * Точка выгрузки модуля. Удаление выполняется в порядке, обратном регистрации:
+ * /proc -> sysfs/gendisk -> tag set -> major -> RAM -> управляющая структура.
+ */
 static void __exit tesda_exit(void) {
   int i;
   struct tesda_dev *dev = tesda;
@@ -551,9 +628,12 @@ static void __exit tesda_exit(void) {
   pr_info(TESDA_NAME ": unloaded\n");
 }
 
+/* Регистрируем функции загрузки и выгрузки в инфраструктуре модулей Linux. */
 module_init(tesda_init);
 module_exit(tesda_exit);
 
+/* Метаданные модуля видны через modinfo; GPL также разрешает GPL-only symbols.
+ */
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Oleg Ulanov");
 MODULE_DESCRIPTION("RAM-backed tesda block devices for Linux 6.1.x");
