@@ -2,6 +2,41 @@
 
 Учебный блочный драйвер для Linux 6.1.x. Проект рассчитан на сборку с headers Linux 6.1.130 и использует современный для этой ветки интерфейс `blk-mq`.
 
+## Настройка окружения  
+### --------------------------------------------- 1. qemu образ  
+####  https://github.com/OTUS-Linux-kernel-dev/Linux-kernel-dev/blob/main/doc/module_1/0x04_QA.md ->  
+##### https://drive.google.com/file/d/1PR166GsjU48tAmWT0s_UAM7OcUmrcze-/view?usp=sharing  
+```
+wget -c  'https://drive.usercontent.google.com/download?id=1PR166GsjU48tAmWT0s_UAM7OcUmrcze-&export=download&authuser=0&confirm=t&uuid=17b39775-6077-48f7-bd96-ee9edb2f614a&at=AMrWOn1CJK0tdnN0hII0qdRdfHft%3A1789811460456' -O debian_12_6.1.130.tar.xz 
+
+tar -xvf debian_12_6.1.130.tar.xz
+
+sudo apt update
+sudo apt install qemu-kvm libvirt-daemon-system libvirt-clients virt-manager screen
+
+sudo systemctl start libvirtd
+sudo systemctl enable libvirtd
+
+
+virt-manager
+```  
+#### Создайте новую виртуальную машину
+#### В интерфейсе virt-manager нажмите на кнопку "Создать виртуальную машину".  
+#### Выберите "Импорт образа диска" и нажмите "Далее".  
+#### Укажите путь к файлу debian_12_6.1.130.qcow2 нажав кнопку «Обзор», а затем «Выбрать файл».  
+#### Выберите Debian 11 или другой наиболее близкий к Debian 12 вариант в выпадающем списке.  
+#### Нажмите "Далее".  
+#### Настройте параметры виртуальной машины, такие как количество ядер процессора и объем оперативной памяти.  
+#### Нажмите "Далее", затем "Готово".  
+
+```qemu-system-x86_64 -enable-kvm -m 2048 -vnc :0 -device virtio-blk-device,drive=hd0 -drive if=none,id=hd0,file=debian_12_6.1.130.qcow2,format=qcow2``` 
+
+#### student:1
+
+
+#### --------------------------------------------- 2.  Модуль ядра  
+```git clone https://github.com/ulego/-2026.git```  
+
 ## Что создаётся
 
 После загрузки модуля должны появиться:
